@@ -17,17 +17,22 @@
 package org.springframework.http.codec.xml;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Stream;
 
 import javax.xml.namespace.QName;
 import javax.xml.stream.events.XMLEvent;
 
 import jakarta.xml.bind.annotation.XmlSeeAlso;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import reactor.core.Exceptions;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -35,7 +40,9 @@ import reactor.test.StepVerifier;
 
 import org.springframework.core.ResolvableType;
 import org.springframework.core.codec.DecodingException;
+import org.springframework.core.codec.Hints;
 import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.core.io.buffer.DataBufferLimitException;
 import org.springframework.core.testfixture.io.buffer.AbstractLeakCheckingTests;
 import org.springframework.http.MediaType;
 import org.springframework.util.MimeType;
@@ -92,7 +99,7 @@ class Jaxb2XmlDecoderTests extends AbstractLeakCheckingTests {
 	@Test
 	void splitOneBranches() {
 		Flux<XMLEvent> xmlEvents = this.xmlEventDecoder.decode(toDataBufferMono(POJO_ROOT), null, null, HINTS);
-		Flux<List<XMLEvent>> result = Jaxb2Helper.split(xmlEvents, Set.of(new QName("pojo")));
+		Flux<List<XMLEvent>> result = Jaxb2Helper.split(xmlEvents, Set.of(new QName("pojo")), null);
 
 		StepVerifier.create(result)
 				.consumeNextWith(events -> {
@@ -113,8 +120,7 @@ class Jaxb2XmlDecoderTests extends AbstractLeakCheckingTests {
 	@Test
 	void splitMultipleBranches() {
 		Flux<XMLEvent> xmlEvents = this.xmlEventDecoder.decode(toDataBufferMono(POJO_CHILD), null, null, HINTS);
-		Flux<List<XMLEvent>> result = Jaxb2Helper.split(xmlEvents, Set.of(new QName("pojo")));
-
+		Flux<List<XMLEvent>> result = Jaxb2Helper.split(xmlEvents, Set.of(new QName("pojo")), null);
 
 		StepVerifier.create(result)
 				.consumeNextWith(events -> {
@@ -140,6 +146,34 @@ class Jaxb2XmlDecoderTests extends AbstractLeakCheckingTests {
 					assertEndElement(events.get(7), "pojo");
 				})
 				.expectComplete()
+				.verify();
+	}
+
+	@Test
+	void splitMultipleBranchesLimitExceeded() {
+
+		Flux<String> source = Flux.just(
+				"<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+				"<root><pojo><foo>foo</foo></pojo>",
+				"<pojo><foo>foofoo</foo>",
+				"<bar>barbar</bar></pojo>",
+				"<root/>");
+
+		XmlEventDecoder.ReceivedByteTracker byteTracker = new XmlEventDecoder.ReceivedByteTracker(30);
+		Map<String, Object> hints = Hints.from(XmlEventDecoder.BYTE_TRACKER_HINT, byteTracker);
+		Flux<XMLEvent> xmlEvents = this.xmlEventDecoder.decode(source.map(this::toToDataBuffer), null, null, hints);
+		Flux<List<XMLEvent>> result = Jaxb2Helper.split(xmlEvents, Set.of(new QName("pojo")), byteTracker);
+
+		StepVerifier.create(result)
+				.consumeNextWith(events -> {
+					assertThat(events).hasSize(5);
+					assertStartElement(events.get(0), "pojo");
+					assertStartElement(events.get(1), "foo");
+					assertCharacters(events.get(2), "foo");
+					assertEndElement(events.get(3), "foo");
+					assertEndElement(events.get(4), "pojo");
+				})
+				.expectError(DataBufferLimitException.class)
 				.verify();
 	}
 
@@ -218,6 +252,117 @@ class Jaxb2XmlDecoderTests extends AbstractLeakCheckingTests {
 	}
 
 	@Test
+	void decodeSingleXmlRootElementLimitExceeded() {
+		this.decoder.setMaxInMemorySize(100);
+
+		// Each child of the root element is small, but the root element as a whole is not
+		List<String> chunks = new ArrayList<>();
+		chunks.add("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+		chunks.add("<pojo>");
+		for (int i = 0; i < 20; i++) {
+			chunks.add("<foo>foofoo</foo>");
+		}
+		chunks.add("<bar>barbar</bar>");
+		chunks.add("</pojo>");
+
+		Flux<DataBuffer> source = Flux.fromIterable(chunks).map(this::toToDataBuffer);
+		Flux<Object> output = this.decoder.decode(source, ResolvableType.forClass(Pojo.class), null, HINTS);
+
+		StepVerifier.create(output)
+				.expectError(DataBufferLimitException.class)
+				.verify();
+	}
+
+	@Test
+	void decodeMultipleXmlRootElementWithinLimit() {
+		this.decoder.setMaxInMemorySize(100);
+
+		// Many small elements, larger than the limit in total, reset the count
+		List<String> chunks = new ArrayList<>();
+		chunks.add("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+		chunks.add("<root>");
+		for (int i = 0; i < 20; i++) {
+			chunks.add("<pojo><foo>foo</foo>");
+			chunks.add("<bar>bar</bar></pojo>");
+		}
+		chunks.add("</root>");
+
+		Flux<DataBuffer> source = Flux.fromIterable(chunks).map(this::toToDataBuffer);
+		Flux<Object> output = this.decoder.decode(source, ResolvableType.forClass(Pojo.class), null, HINTS);
+
+		StepVerifier.create(output)
+				.expectNextCount(20)
+				.expectComplete()
+				.verify();
+	}
+
+	@Test
+	void decodeUnterminatedXmlNodeLimitExceeded() {
+		this.decoder.setMaxInMemorySize(100);
+
+		// Unterminated comment: no XML event is emitted while the parser buffers it
+		List<String> chunks = new ArrayList<>();
+		chunks.add("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+		chunks.add("<root><!--");
+		for (int i = 0; i < 20; i++) {
+			chunks.add("aaaaaaaaaaaaaaaa");
+		}
+
+		Flux<DataBuffer> source = Flux.fromIterable(chunks).map(this::toToDataBuffer);
+		Flux<Object> output = this.decoder.decode(source, ResolvableType.forClass(Pojo.class), null, HINTS);
+
+		StepVerifier.create(output)
+				.expectError(DataBufferLimitException.class)
+				.verify();
+	}
+
+	@ParameterizedTest(name = "{0}")
+	@MethodSource("unterminatedTokens")
+	void unterminatedTokenInsideMatchedElementLimitExceeded(String name, String tokenStart) {
+		assertLimitExceeded("<pojo><foo>foo</foo>" + tokenStart);
+	}
+
+	@ParameterizedTest(name = "{0}")
+	@MethodSource("unterminatedTokens")
+	void unterminatedTokenOutsideMatchedElementLimitExceeded(String name, String tokenStart) {
+		assertLimitExceeded("<?xml version=\"1.0\" encoding=\"UTF-8\"?><other>" + tokenStart);
+	}
+
+	static Stream<Arguments> unterminatedTokens() {
+		return Stream.of(
+				Arguments.of("attribute value", "<foo attr=\""),
+				Arguments.of("comment", "<!--"),
+				Arguments.of("CDATA section", "<![CDATA["),
+				Arguments.of("processing instruction", "<?target "));
+	}
+
+	private void assertLimitExceeded(String prefix) {
+		this.decoder.setMaxInMemorySize(1024);
+
+		Flux<DataBuffer> source = Flux.just(prefix)
+				.concatWith(Flux.range(0, 3).map(i -> "x".repeat(512)))
+				.map(this::toToDataBuffer);
+
+		Flux<?> output = this.decoder.decode(source, ResolvableType.forClass(Pojo.class), null, HINTS);
+
+		StepVerifier.create(output)
+				.thenConsumeWhile(object -> true)
+				.expectError(DataBufferLimitException.class)
+				.verify();
+	}
+
+	@Test
+	void manySmallElementsInLargeBufferWithinLimit() {
+		this.decoder.setMaxInMemorySize(1024);
+		String xml = "<root>" + "<pojo><foo>f</foo><bar>b</bar></pojo>".repeat(100) + "</root>";
+		Flux<DataBuffer> source = Flux.just(xml).map(this::toToDataBuffer);
+
+		Flux<Object> output = this.decoder.decode(source, ResolvableType.forClass(Pojo.class), null, HINTS);
+
+		StepVerifier.create(output).expectNextCount(100).expectComplete().verify();
+	}
+
+	@Test
 	void decodeError() {
 		Flux<DataBuffer> source = Flux.concat(
 				toDataBufferMono("<pojo>"),
@@ -263,11 +408,16 @@ class Jaxb2XmlDecoderTests extends AbstractLeakCheckingTests {
 
 	private Mono<DataBuffer> toDataBufferMono(String value) {
 		return Mono.defer(() -> {
-			byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-			DataBuffer buffer = this.bufferFactory.allocateBuffer(bytes.length);
-			buffer.write(bytes);
+			DataBuffer buffer = toToDataBuffer(value);
 			return Mono.just(buffer);
 		});
+	}
+
+	private DataBuffer toToDataBuffer(String value) {
+		byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+		DataBuffer buffer = this.bufferFactory.allocateBuffer(bytes.length);
+		buffer.write(bytes);
+		return buffer;
 	}
 
 	@jakarta.xml.bind.annotation.XmlType
