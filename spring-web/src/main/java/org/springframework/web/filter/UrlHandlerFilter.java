@@ -308,9 +308,13 @@ public final class UrlHandlerFilter extends OncePerRequestFilter {
 		public void handleInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
 				throws IOException {
 
+			String location = trimTrailingSlash(request.getRequestURI());
+			while (location.length() > 2 && location.startsWith("//")) {
+				location = location.substring(1);
+			}
 			response.resetBuffer();
 			response.setStatus(this.httpStatus.value());
-			response.setHeader(HttpHeaders.LOCATION, trimTrailingSlash(request.getRequestURI()));
+			response.setHeader(HttpHeaders.LOCATION, location);
 			response.flushBuffer();
 		}
 	}
